@@ -26,7 +26,7 @@ Values:
 
 ```text
 0     = disabled; use the game's normal configured value
-1-999 = force that exact 24 hour cycle length in minutes
+1-240 = force that exact 24 hour cycle length in minutes
 ```
 
 Examples:
