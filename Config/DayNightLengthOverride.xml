@@ -1,0 +1,7 @@
+<Straw>
+
+	<!--  0 = use default sandbox value; 1-999 = override Day/NightLength with the amount of minutes  -->
+
+	<setting name="DayNightLengthOverride" value="0" />
+  
+</Straw>

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xml>
+  <Name value="Straw-DayNightLengthOverride" />
+  <DisplayName value="Day-Night Length Override" />
+  <Description value="XML-config override for 1-999 minute 24 hour cycle length for v3.0 EXP. Also updates TimeOfDayIncPerSec." />
+  <Author value="Straw" />
+  <Version value="1.0" />
+</xml>
