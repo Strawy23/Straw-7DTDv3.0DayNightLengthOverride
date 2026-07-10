@@ -10,13 +10,14 @@ public class DayNightLengthOverrideApi : IModApi
     {
         try
         {
-            DayNightLengthLog.Out("Init: XML-config DayNightLength override mode with GameStats runtime hook.");
+            DayNightLengthLog.Out("Init: XML-config DayNightLength override mode with precise runtime time-scale hook.");
 
             int overrideMinutes = DayNightLengthOverride.ReadConfigOverrideMinutes();
-            if (overrideMinutes >= 1 && overrideMinutes <= 999)
+            if (overrideMinutes >= 1 && overrideMinutes <= 2400)
             {
                 DayNightLengthOverride.ConfigureOverride(overrideMinutes);
                 DayNightLengthOverride.PatchRuntimeGameStatsWriters();
+                DayNightLengthOverride.PatchPreciseTimeScaleHooks();
                 DayNightLengthOverride.ApplyExplicitDayNightLength(overrideMinutes, "config override at mod init");
                 DayNightLengthOverride.RegisterGameStartDoneHook();
             }
@@ -38,8 +39,17 @@ public static class DayNightLengthOverride
     private static bool gameStartDoneHookRegistered;
     private static bool gameStartDoneApplied;
     private static bool harmonyPatchAttempted;
+    private static bool precisePatchAttempted;
+    private static bool precisePatchInstalled;
+    private static bool preciseGetIntInstalled;
+    private static bool inTimeOfDayUpdate;
+    private static bool suppressPreciseGetInt;
+    private static bool runtimeCorrectionLogWritten;
+    private static double preciseCarrySeconds;
+    private static int preciseFrameIncPerSec;
     private static bool applyingOverride;
     private static Harmony harmonyInstance;
+    private static MethodInfo unityDeltaTimeGetter;
 
     public static void ConfigureOverride(int minutes)
     {
@@ -49,12 +59,25 @@ public static class DayNightLengthOverride
 
     private static bool IsValidOverrideMinutes(int minutes)
     {
-        return minutes >= 1 && minutes <= 999;
+        return minutes >= 1 && minutes <= 2400;
     }
 
     private static int CalculateTimeOfDayIncPerSec(int minutes)
     {
-        return Math.Max(1, (int)Math.Round(2400.0 / ((double)minutes * 10.0)));
+        return Math.Max(1, (int)Math.Round(2400.0 / (double)minutes));
+    }
+
+    private static double CalculateExactTimeOfDayIncPerSec(int minutes)
+    {
+        if (minutes <= 0)
+            return 0.0;
+        return 2400.0 / (double)minutes;
+    }
+
+    private static bool NeedsPreciseTimeScale(int minutes)
+    {
+        double exact = CalculateExactTimeOfDayIncPerSec(minutes);
+        return Math.Abs(exact - Math.Round(exact)) > 0.000001;
     }
 
     public static int ReadConfigOverrideMinutes()
@@ -64,7 +87,7 @@ public static class DayNightLengthOverride
             string path = FindConfigFile();
             if (string.IsNullOrEmpty(path) || !File.Exists(path))
             {
-                DayNightLengthLog.Warning("No config file found. Expected Config/DayNightLengthOverride.xml next to the mod. Mod inactive.");
+                DayNightLengthLog.Warning("No config file found. Expected Config/DayNightLengthOverride.xml in the mod folder. Mod inactive.");
                 return 0;
             }
 
@@ -75,13 +98,13 @@ public static class DayNightLengthOverride
                 DayNightLengthLog.Out("Config loaded from " + path + ": DayNightLengthOverride=0. Mod inactive; vanilla value is used.");
                 return 0;
             }
-            if (value >= 1 && value <= 999)
+            if (value >= 1 && value <= 2400)
             {
                 DayNightLengthLog.Out("Config loaded from " + path + ": DayNightLengthOverride=" + value);
                 return value;
             }
 
-            DayNightLengthLog.Warning("Invalid DayNightLengthOverride=" + value + "; expected 0 or a value from 1 to 999. Mod inactive.");
+            DayNightLengthLog.Warning("Invalid DayNightLengthOverride=" + value + "; expected 0 or a value from 1 to 2400. Mod inactive.");
             return 0;
         }
         catch (Exception ex)
@@ -154,6 +177,159 @@ public static class DayNightLengthOverride
         }
     }
 
+    public static void PatchPreciseTimeScaleHooks()
+    {
+        if (precisePatchAttempted)
+            return;
+
+        precisePatchAttempted = true;
+
+        int minutes = configuredOverrideMinutes;
+        if (!IsValidOverrideMinutes(minutes))
+            return;
+
+        try
+        {
+            Type enumStatsType = FindType("EnumGameStats");
+            Type gameStatsType = FindType("GameStats");
+            if (enumStatsType != null && gameStatsType != null)
+            {
+                if (harmonyInstance == null)
+                    harmonyInstance = new Harmony("com.straw.daynightlengthoverride");
+
+                MethodInfo getInt = FindStaticMethod(gameStatsType, "GetInt", new Type[] { enumStatsType });
+                MethodInfo getIntPrefix = typeof(DayNightLengthOverride).GetMethod("GameStatsGetIntPrefix", BindingFlags.Static | BindingFlags.NonPublic);
+                if (getInt != null && getIntPrefix != null)
+                {
+                    harmonyInstance.Patch(getInt, new HarmonyMethod(getIntPrefix), null, null);
+                    preciseGetIntInstalled = true;
+                    DayNightLengthLog.Out("Patched GameStats.GetInt(EnumGameStats) prefix for precise TimeOfDayIncPerSec reads.");
+                }
+                else
+                {
+                    DayNightLengthLog.Warning("Could not find GameStats.GetInt(EnumGameStats); precise time-scale read hook was not installed.");
+                }
+            }
+            else
+            {
+                DayNightLengthLog.Warning("Could not find GameStats/EnumGameStats; precise time-scale read hook was not installed.");
+            }
+
+            Type gameManagerType = FindType("GameManager");
+            if (gameManagerType != null)
+            {
+                MethodInfo updateMethod = FindMethodByName(gameManagerType, "updateTimeOfDay");
+                MethodInfo updatePrefix = typeof(DayNightLengthOverride).GetMethod("GameManagerUpdateTimeOfDayPrefix", BindingFlags.Static | BindingFlags.NonPublic);
+                MethodInfo updatePostfix = typeof(DayNightLengthOverride).GetMethod("GameManagerUpdateTimeOfDayPostfix", BindingFlags.Static | BindingFlags.NonPublic);
+                if (updateMethod != null && updatePrefix != null && updatePostfix != null)
+                {
+                    if (harmonyInstance == null)
+                        harmonyInstance = new Harmony("com.straw.daynightlengthoverride");
+                    harmonyInstance.Patch(updateMethod, new HarmonyMethod(updatePrefix), new HarmonyMethod(updatePostfix), null);
+                    precisePatchInstalled = true;
+                    DayNightLengthLog.Out("Patched GameManager.updateTimeOfDay for precise day lengths above vanilla integer buckets.");
+                }
+                else
+                {
+                    DayNightLengthLog.Warning("Could not find GameManager.updateTimeOfDay; precise time-scale update hook was not installed.");
+                }
+            }
+            else
+            {
+                DayNightLengthLog.Warning("Could not find GameManager; precise time-scale update hook was not installed.");
+            }
+        }
+        catch (Exception ex)
+        {
+            DayNightLengthLog.Warning("Precise time-scale hook setup failed: " + ex.Message + "; falling back to integer TimeOfDayIncPerSec.");
+        }
+    }
+
+    private static void GameManagerUpdateTimeOfDayPrefix()
+    {
+        int minutes = configuredOverrideMinutes;
+        if (!IsValidOverrideMinutes(minutes) || !preciseGetIntInstalled)
+            return;
+
+        preciseFrameIncPerSec = CalculatePreciseFrameIncPerSec(minutes);
+        inTimeOfDayUpdate = true;
+    }
+
+    private static void GameManagerUpdateTimeOfDayPostfix()
+    {
+        inTimeOfDayUpdate = false;
+    }
+
+    private static bool GameStatsGetIntPrefix(object[] __args, ref int __result)
+    {
+        if (suppressPreciseGetInt || applyingOverride || !inTimeOfDayUpdate)
+            return true;
+        if (__args == null || __args.Length < 1)
+            return true;
+        if (!IsEnumValueNamed(__args[0], "TimeOfDayIncPerSec"))
+            return true;
+
+        __result = preciseFrameIncPerSec;
+        return false;
+    }
+
+    private static int CalculatePreciseFrameIncPerSec(int minutes)
+    {
+        double exact = CalculateExactTimeOfDayIncPerSec(minutes);
+        if (exact <= 0.0)
+            return CalculateTimeOfDayIncPerSec(minutes);
+
+        int baseInc = (int)Math.Floor(exact);
+        double fraction = exact - (double)baseInc;
+        if (fraction <= 0.000001)
+            return Math.Max(1, baseInc);
+
+        double delta = GetUnityDeltaTime();
+        if (delta <= 0.000001 || delta > 1.0)
+            delta = 0.02;
+
+        preciseCarrySeconds += fraction * delta;
+        int extra = 0;
+        while (preciseCarrySeconds + 0.0000001 >= delta)
+        {
+            extra++;
+            preciseCarrySeconds -= delta;
+            if (extra > 4)
+                break;
+        }
+
+        int result = baseInc + extra;
+        if (result < 1)
+            result = 1;
+        return result;
+    }
+
+    private static double GetUnityDeltaTime()
+    {
+        try
+        {
+            if (unityDeltaTimeGetter == null)
+            {
+                Type timeType = FindType("UnityEngine.Time");
+                if (timeType != null)
+                {
+                    PropertyInfo prop = timeType.GetProperty("deltaTime", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                    if (prop != null)
+                        unityDeltaTimeGetter = prop.GetGetMethod(true);
+                }
+            }
+
+            if (unityDeltaTimeGetter != null)
+            {
+                object value = unityDeltaTimeGetter.Invoke(null, null);
+                return Convert.ToDouble(value, CultureInfo.InvariantCulture);
+            }
+        }
+        catch { }
+
+        return 0.02;
+    }
+
     private static void GameStatsSetPostfix(object[] __args)
     {
         if (applyingOverride)
@@ -196,16 +372,22 @@ public static class DayNightLengthOverride
     private static bool IsCurrentRuntimeStateCorrect(int minutes)
     {
         int currentMinutes = GetGameStatInt("DayNightLength", -9999);
+        if (currentMinutes != minutes)
+            return false;
+
+        if (precisePatchInstalled && NeedsPreciseTimeScale(minutes))
+            return true;
+
         int currentInc = GetGameStatInt("TimeOfDayIncPerSec", -9999);
         int wantedInc = CalculateTimeOfDayIncPerSec(minutes);
-        return currentMinutes == minutes && currentInc == wantedInc;
+        return currentInc == wantedInc;
     }
 
     public static void ApplyExplicitDayNightLength(int minutes, string reason)
     {
         if (!IsValidOverrideMinutes(minutes))
         {
-            DayNightLengthLog.Warning("ApplyExplicitDayNightLength ignored invalid value: " + minutes + "; expected 1 to 999.");
+            DayNightLengthLog.Warning("ApplyExplicitDayNightLength ignored invalid value: " + minutes + "; expected 1 to 2400.");
             return;
         }
 
@@ -226,9 +408,27 @@ public static class DayNightLengthOverride
             applyingOverride = oldApplying;
         }
 
-        DayNightLengthLog.Out("Applied DayNightLength override from " + reason + ": " + minutes +
-                           " minute(s) (GamePref set=" + prefOk + "; GameStat set=" + statOk +
-                           "; TimeOfDayIncPerSec set=" + incOk + "; TimeOfDayIncPerSec=" + incPerSec + ").");
+        LogApplyResult(reason, minutes, prefOk, statOk, incOk, incPerSec);
+    }
+
+    private static void LogApplyResult(string reason, int minutes, bool prefOk, bool statOk, bool incOk, int incPerSec)
+    {
+        bool runtime = !string.IsNullOrEmpty(reason) && reason.IndexOf("runtime hook", StringComparison.OrdinalIgnoreCase) >= 0;
+        string preciseText = precisePatchInstalled && NeedsPreciseTimeScale(minutes) ? "; precise time-scale hook active" : "";
+        string message = "Applied DayNightLength override from " + reason + ": " + minutes +
+                         " minute(s) (GamePref set=" + prefOk + "; GameStat set=" + statOk +
+                         "; TimeOfDayIncPerSec set=" + incOk + "; fallback TimeOfDayIncPerSec=" + incPerSec + preciseText + ").";
+
+        if (runtime)
+        {
+            if (runtimeCorrectionLogWritten)
+                return;
+            runtimeCorrectionLogWritten = true;
+            DayNightLengthLog.Out(message);
+            return;
+        }
+
+        DayNightLengthLog.Out(message);
     }
 
     public static void RegisterGameStartDoneHook()
@@ -262,12 +462,21 @@ public static class DayNightLengthOverride
 
         int prefValue = GetGamePrefInt("DayNightLength", -9999);
         int statValue = GetGameStatInt("DayNightLength", -9999);
-        int incValue = GetGameStatInt("TimeOfDayIncPerSec", -9999);
         int wantedInc = CalculateTimeOfDayIncPerSec(minutes);
-        if (prefValue == minutes && statValue == minutes && incValue == wantedInc)
+        if (prefValue == minutes && statValue == minutes)
         {
-            DayNightLengthLog.Out("GameStartDone final verification: DayNightLength already correct at " + minutes + " minute(s), TimeOfDayIncPerSec=" + wantedInc + ".");
-            return;
+            if (precisePatchInstalled && NeedsPreciseTimeScale(minutes))
+            {
+                DayNightLengthLog.Out("GameStartDone final verification: DayNightLength already correct at " + minutes + " minute(s); precise time-scale hook is active with fallback TimeOfDayIncPerSec=" + wantedInc + ".");
+                return;
+            }
+
+            int incValue = GetGameStatInt("TimeOfDayIncPerSec", -9999);
+            if (incValue == wantedInc)
+            {
+                DayNightLengthLog.Out("GameStartDone final verification: DayNightLength already correct at " + minutes + " minute(s), TimeOfDayIncPerSec=" + wantedInc + ".");
+                return;
+            }
         }
 
         ApplyExplicitDayNightLength(minutes, "GameStartDone final verification hook");
@@ -275,17 +484,75 @@ public static class DayNightLengthOverride
 
     private static string FindConfigFile()
     {
+        string fileName = "DayNightLengthOverride.xml";
         string dllPath = null;
         try { dllPath = Assembly.GetExecutingAssembly().Location; } catch { }
-        if (string.IsNullOrEmpty(dllPath))
-            return null;
 
-        string dllDir = Path.GetDirectoryName(dllPath);
-        if (string.IsNullOrEmpty(dllDir))
-            return null;
+        string dllDir = null;
+        if (!string.IsNullOrEmpty(dllPath))
+            dllDir = Path.GetDirectoryName(dllPath);
 
-        string path = Path.Combine(dllDir, "Config", "DayNightLengthOverride.xml");
-        return File.Exists(path) ? path : null;
+        string[] candidates = new string[64];
+        int count = 0;
+
+        if (!string.IsNullOrEmpty(dllDir))
+        {
+            count = AddConfigCandidate(candidates, count, Path.Combine(dllDir, "Config", fileName));
+            count = AddConfigCandidate(candidates, count, Path.Combine(dllDir, fileName));
+
+            DirectoryInfo parentInfo = null;
+            try { parentInfo = Directory.GetParent(dllDir); } catch { }
+            string parent = parentInfo != null ? parentInfo.FullName : null;
+            if (!string.IsNullOrEmpty(parent))
+            {
+                count = AddConfigCandidate(candidates, count, Path.Combine(parent, "Config", fileName));
+                count = AddConfigCandidate(candidates, count, Path.Combine(parent, fileName));
+            }
+        }
+
+        string baseDir = null;
+        try { baseDir = AppDomain.CurrentDomain.BaseDirectory; } catch { }
+        if (!string.IsNullOrEmpty(baseDir))
+        {
+            string modsDir = Path.Combine(baseDir, "Mods");
+            if (Directory.Exists(modsDir))
+            {
+            candidates[count++] = Path.Combine(modsDir, "Straw-DayNightLengthOverride", "Config", fileName);
+            candidates[count++] = Path.Combine(modsDir, "Straw-DayNightLengthOverride1.3", "Config", fileName);
+            candidates[count++] = Path.Combine(modsDir, "Straw-DayNightLengthOverride1.2-test", "Config", fileName);
+            candidates[count++] = Path.Combine(modsDir, "Straw-DayNightLengthOverride1.1-test", "Config", fileName);
+                try
+                {
+                    string[] matchingDirs = Directory.GetDirectories(modsDir, "*DayNightLengthOverride*", SearchOption.TopDirectoryOnly);
+                    for (int i = 0; i < matchingDirs.Length; i++)
+                        count = AddConfigCandidate(candidates, count, Path.Combine(matchingDirs[i], "Config", fileName));
+                }
+                catch { }
+            }
+        }
+
+        for (int i = 0; i < count; i++)
+        {
+            if (!string.IsNullOrEmpty(candidates[i]) && File.Exists(candidates[i]))
+                return candidates[i];
+        }
+
+        return null;
+    }
+
+    private static int AddConfigCandidate(string[] candidates, int count, string path)
+    {
+        if (string.IsNullOrEmpty(path) || candidates == null || count >= candidates.Length)
+            return count;
+
+        for (int i = 0; i < count; i++)
+        {
+            if (string.Equals(candidates[i], path, StringComparison.OrdinalIgnoreCase))
+                return count;
+        }
+
+        candidates[count] = path;
+        return count + 1;
     }
 
     private static int ReadNamedSettingInt(string text, string settingName, int defaultValue)
@@ -318,7 +585,7 @@ public static class DayNightLengthOverride
 
         string marker = attrName + "=\"";
         int ix = text.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
-        char quote = '\"';
+        char quote = '"';
         if (ix < 0)
         {
             marker = attrName + "='";
@@ -347,6 +614,21 @@ public static class DayNightLengthOverride
         {
             return false;
         }
+    }
+
+    private static MethodInfo FindMethodByName(Type type, string methodName)
+    {
+        if (type == null || string.IsNullOrEmpty(methodName))
+            return null;
+
+        MethodInfo[] methods = type.GetMethods(BindingFlags.Static | BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        for (int i = 0; i < methods.Length; i++)
+        {
+            if (string.Equals(methods[i].Name, methodName, StringComparison.Ordinal))
+                return methods[i];
+        }
+
+        return null;
     }
 
     private static MethodInfo FindStaticMethod(Type type, string methodName, Type[] parameterTypes)
@@ -405,6 +687,8 @@ public static class DayNightLengthOverride
 
     private static int GetGameStatInt(string statName, int defaultValue)
     {
+        bool oldSuppress = suppressPreciseGetInt;
+        suppressPreciseGetInt = true;
         try
         {
             Type statsType = FindType("GameStats");
@@ -421,6 +705,10 @@ public static class DayNightLengthOverride
         catch
         {
             return defaultValue;
+        }
+        finally
+        {
+            suppressPreciseGetInt = oldSuppress;
         }
     }
 
