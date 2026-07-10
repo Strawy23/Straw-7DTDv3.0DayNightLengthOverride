@@ -1,6 +1,8 @@
 # Straw Day/Night Length Override
 
-A small 7 Days to Die V3.0 dedicated-server mod that lets you force the `DayNightLength` / `24 Hour Cycle` setting to any value from 1 to 999 minutes through an XML config file.
+A small 7 Days to Die V3.0 dedicated-server and single player mod that lets you force the `DayNightLength` / `24 Hour Cycle` setting to any value from 1 to 2400 minutes through an XML config file.
+
+v1.1 Update: Fixed bug preventing load on dedicated servers. Also added support for up to 2400 minutes.
 
 ## What it does
 
